@@ -68,6 +68,30 @@ Differential expression analysis identified thousands of metastasis-associated g
 
 GO enrichment of shared upregulated metastasis genes suggested enrichment for metabolic and small-molecule biological processes.
 
+### Global PCA
+
+The global PCA demonstrates that tissue-of-origin is the dominant source of transcriptomic variation, separating PanNET and SI-NET samples into distinct clusters.
+
+![Global PCA](figures/GlobalPCA.pdf)
+
+### Differential Expression Analysis
+
+DESeq2 analysis identified widespread metastasis-associated transcriptional changes in PanNET samples.
+
+![Volcano Plot](figures/VolcanoPlot.pdf)
+
+### Metastasis-Associated Gene Programs
+
+Heatmap clustering of the top differentially expressed genes demonstrates coordinated transcriptional programs associated with metastatic progression.
+
+![Heatmap](figures/Heatmap.pdf)
+
+### Pathway Enrichment
+
+Shared metastasis-associated genes were enriched for metabolic and small-molecule biological processes.
+
+![GO Enrichment](figures/GeneEnrichment.png)
+
 ## Tools Used
 
 - R
