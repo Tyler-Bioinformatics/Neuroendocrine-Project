@@ -1,0 +1,634 @@
+---
+title: "Neuroendocrine RNA-seq Metastasis Project"
+author: "Tyler Hearnsberger"
+date: "2025-12-13"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+  pdf_document: default
+editor_options:
+  markdown:
+    wrap: 72
+---
+
+# 1. Project Overview
+
+This project analyzes publicly available RNA-seq data from GEO accession
+GSE98894, which profiles gene expression in gastro-entero-pancreatic
+neuroendocrine tumors (GEP-NETs).
+
+The main goal is to determine whether metastatic progression in GEP-NETs is
+associated with a shared transcriptional program across pancreatic
+neuroendocrine tumors (PanNETs) and small-intestinal neuroendocrine tumors
+(SI-NETs), while avoiding confounding from tissue-of-origin differences.
+
+```{r setup, message=FALSE, warning=FALSE}
+# ============================================================
+# 0. LIBRARIES
+# ============================================================
+
+library(DESeq2)
+library(tidyverse)
+library(apeglm)
+library(pheatmap)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+```
+
+# 2. Load Raw Counts
+
+```{r load-counts, message=FALSE}
+# ============================================================
+# 1. LOAD RAW COUNTS
+# ============================================================
+
+counts <- read_tsv(
+  "data/GSE98894_raw_counts_GRCh38.p13_NCBI.tsv",
+  show_col_types = FALSE
+)
+
+counts <- counts %>%
+  column_to_rownames("GeneID")
+```
+
+# 3. Parse GEO Metadata
+
+```{r parse-metadata}
+# ============================================================
+# 2. LOAD RAW GEO METADATA
+# ============================================================
+
+meta_raw <- readLines("data/GSE98894_series_matrix.txt")
+
+# ============================================================
+# 3. EXTRACT GSM SAMPLE IDS
+# ============================================================
+
+gsm_line <- meta_raw[grep("^!Sample_geo_accession", meta_raw)]
+gsm_ids <- strsplit(gsm_line, "\t")[[1]][-1]
+gsm_ids <- gsub('"', "", gsm_ids)
+
+# ============================================================
+# 4. EXTRACT SAMPLE CHARACTERISTICS
+# ============================================================
+
+char_lines <- meta_raw[grep("!Sample_characteristics", meta_raw)]
+
+site_line <- char_lines[
+  grep("pancreas|intestin|ileum|rect", char_lines, ignore.case = TRUE)
+][1]
+
+site_vals <- strsplit(site_line, "\t")[[1]][-1]
+site_vals <- gsub('"', "", site_vals)
+site_vals <- tolower(site_vals)
+
+status_line <- char_lines[
+  grep("primary|metast", char_lines, ignore.case = TRUE)
+][1]
+
+status_vals <- strsplit(status_line, "\t")[[1]][-1]
+status_vals <- gsub('"', "", status_vals)
+status_vals <- tolower(status_vals)
+```
+
+# 4. Build Clean Metadata Table
+
+```{r clean-metadata}
+# ============================================================
+# 5. BUILD CLEAN METADATA TABLE
+# ============================================================
+
+meta_clean <- tibble(
+  sample = gsm_ids,
+  site_raw = site_vals,
+  status_raw = status_vals
+) %>%
+  mutate(
+    site = case_when(
+      str_detect(site_raw, "pancreas") ~ "PanNET",
+      str_detect(site_raw, "intestin|ileum") ~ "SI-NET",
+      str_detect(site_raw, "rect") ~ "RE-NET",
+      TRUE ~ NA_character_
+    ),
+    status = case_when(
+      str_detect(status_raw, "primary") ~ "Primary",
+      str_detect(status_raw, "metast") ~ "Metastasis",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  select(sample, site, status)
+
+# Focus project on PanNET and SI-NET samples.
+meta_clean <- meta_clean %>%
+  filter(site %in% c("PanNET", "SI-NET"))
+```
+
+# 5. Align Metadata and Counts
+
+```{r align-data}
+# ============================================================
+# 6. ALIGN METADATA AND COUNTS
+# ============================================================
+
+common_samples <- meta_clean$sample
+
+counts <- counts[, common_samples]
+meta_clean <- meta_clean %>%
+  arrange(match(sample, colnames(counts)))
+
+stopifnot(all(meta_clean$sample == colnames(counts)))
+
+# Sanity checks
+dim(counts)
+dim(meta_clean)
+table(meta_clean$site, meta_clean$status)
+```
+
+# 6. Create DESeq2 Object
+
+```{r create-dds}
+# ============================================================
+# 7. CREATE DESEQ2 OBJECT
+# ============================================================
+
+dds <- DESeqDataSetFromMatrix(
+  countData = counts,
+  colData   = meta_clean,
+  design    = ~ site + status
+)
+
+dds <- dds[rowSums(counts(dds)) > 10, ]
+dds
+```
+
+# 7. PCA Quality Control
+
+PCA was used as an exploratory quality-control step. The goal was to determine
+whether samples cluster according to known biological variables, especially
+tissue of origin and metastatic status.
+
+```{r vst}
+# ============================================================
+# 8. VARIANCE-STABILIZING TRANSFORMATION
+# ============================================================
+
+vsd <- vst(dds, blind = FALSE)
+vsd_mat <- assay(vsd)
+```
+
+```{r global-pca, fig.width=7, fig.height=5}
+# ============================================================
+# 9. PCA - ALL SAMPLES
+# ============================================================
+
+pca_data <- plotPCA(vsd, intgroup = c("site", "status"), returnData = TRUE)
+percentVar <- round(100 * attr(pca_data, "percentVar"))
+
+p_global <- ggplot(pca_data, aes(PC1, PC2, color = site, shape = status)) +
+  geom_point(size = 3, alpha = 0.8) +
+  xlab(paste0("PC1: ", percentVar[1], "% variance")) +
+  ylab(paste0("PC2: ", percentVar[2], "% variance")) +
+  theme_classic() +
+  ggtitle("PCA of GEP-NET Samples (VST)")
+
+p_global
+
+ggsave("figures/global_pca.png", p_global, width = 7, height = 5, dpi = 300)
+```
+
+## PCA Interpretation
+
+The global PCA is expected to show tissue of origin as the dominant source of
+variation, with PanNET and SI-NET samples separating primarily along PC1. This
+supports the need for tissue-stratified analysis rather than pooling all tumors
+together.
+
+# 8. Tissue-Specific PCA
+
+```{r pannet-pca, fig.width=7, fig.height=5}
+# ============================================================
+# 10. PCA - PanNET ONLY
+# ============================================================
+
+pan_idx <- meta_clean$site == "PanNET"
+pca_pan <- prcomp(t(vsd_mat[, pan_idx]), scale. = FALSE)
+
+pan_df <- data.frame(
+  pca_pan$x,
+  status = meta_clean$status[pan_idx]
+)
+
+p_pan <- ggplot(pan_df, aes(PC1, PC2, color = status)) +
+  geom_point(size = 3, alpha = 0.8) +
+  theme_classic() +
+  ggtitle("PCA - PanNET Only")
+
+p_pan
+
+ggsave("figures/pannet_pca.png", p_pan, width = 7, height = 5, dpi = 300)
+```
+
+```{r sinet-pca, fig.width=7, fig.height=5}
+# ============================================================
+# 11. PCA - SI-NET ONLY
+# ============================================================
+
+si_idx <- meta_clean$site == "SI-NET"
+pca_si <- prcomp(t(vsd_mat[, si_idx]), scale. = FALSE)
+
+si_df <- data.frame(
+  pca_si$x,
+  status = meta_clean$status[si_idx]
+)
+
+p_si <- ggplot(si_df, aes(PC1, PC2, color = status)) +
+  geom_point(size = 3, alpha = 0.8) +
+  theme_classic() +
+  ggtitle("PCA - SI-NET Only")
+
+p_si
+
+ggsave("figures/sinet_pca.png", p_si, width = 7, height = 5, dpi = 300)
+```
+
+# 9. PanNET Differential Expression
+
+```{r pannet-de}
+# ============================================================
+# 12. DESEQ2 - PanNET ONLY
+# ============================================================
+
+dds_pan <- dds[, dds$site == "PanNET"]
+dds_pan$site <- droplevels(dds_pan$site)
+dds_pan$status <- relevel(dds_pan$status, ref = "Primary")
+
+design(dds_pan) <- ~ status
+
+dds_pan <- DESeq(dds_pan)
+
+res_pan <- results(dds_pan, contrast = c("status", "Metastasis", "Primary"))
+res_pan <- lfcShrink(
+  dds_pan,
+  coef = "status_Metastasis_vs_Primary",
+  res = res_pan,
+  type = "apeglm"
+)
+
+res_pan_df <- as.data.frame(res_pan) %>%
+  rownames_to_column("GeneID") %>%
+  arrange(padj)
+
+write_csv(res_pan_df, "results/PanNET_DE_Metastasis_vs_Primary.csv")
+
+summary(res_pan)
+sum(res_pan_df$padj < 0.05, na.rm = TRUE)
+```
+
+```{r pannet-volcano, fig.width=7, fig.height=5}
+# ============================================================
+# 13. VOLCANO PLOT - PanNET
+# ============================================================
+
+res_pan_df <- res_pan_df %>%
+  mutate(
+    sig = if_else(
+      !is.na(padj) & padj < 0.05 & abs(log2FoldChange) >= 1,
+      "Significant",
+      "Not significant"
+    )
+  )
+
+p_volcano_pan <- ggplot(res_pan_df, aes(x = log2FoldChange, y = -log10(padj), color = sig)) +
+  geom_point(alpha = 0.6, size = 1.5) +
+  theme_classic() +
+  ggtitle("PanNET: Metastasis vs Primary") +
+  xlab("log2 Fold Change (Metastasis / Primary)") +
+  ylab("-log10 adjusted p-value")
+
+p_volcano_pan
+
+ggsave("figures/pannet_volcano.png", p_volcano_pan, width = 7, height = 5, dpi = 300)
+```
+
+```{r pannet-top10}
+top10_pan <- res_pan_df %>%
+  filter(!is.na(padj)) %>%
+  slice(1:10)
+
+top10_pan
+```
+
+# 10. PanNET Heat Map
+
+```{r pannet-heatmap, fig.width=8, fig.height=8}
+# ============================================================
+# 14. HEAT MAP - TOP PAN-NET METASTASIS GENES
+# ============================================================
+
+top_genes_pan <- res_pan_df %>%
+  filter(!is.na(padj), padj < 0.05, abs(log2FoldChange) >= 1) %>%
+  slice(1:40) %>%
+  pull(GeneID)
+
+vsd_pan <- vst(dds_pan, blind = FALSE)
+mat_pan <- assay(vsd_pan)[top_genes_pan, ]
+
+mat_pan_z <- t(scale(t(mat_pan)))
+
+annotation_col <- data.frame(
+  Status = colData(dds_pan)$status
+)
+
+rownames(annotation_col) <- colnames(mat_pan_z)
+
+pheatmap(
+  mat_pan_z,
+  annotation_col = annotation_col,
+  cluster_rows = TRUE,
+  cluster_cols = TRUE,
+  show_colnames = FALSE,
+  fontsize_row = 8,
+  scale = "none",
+  main = "PanNET: Metastasis vs Primary\nTop Differentially Expressed Genes",
+  filename = "figures/pannet_heatmap.png"
+)
+```
+
+# 11. SI-NET Differential Expression
+
+```{r sinet-de}
+# ============================================================
+# 15. DESEQ2 - SI-NET ONLY
+# ============================================================
+
+dds_sinet <- dds[, dds$site == "SI-NET"]
+dds_sinet$site <- droplevels(dds_sinet$site)
+dds_sinet$status <- relevel(dds_sinet$status, ref = "Primary")
+
+design(dds_sinet) <- ~ status
+
+dds_sinet <- DESeq(dds_sinet)
+
+res_sinet <- results(dds_sinet)
+
+res_sinet_df <- as.data.frame(res_sinet) %>%
+  rownames_to_column("GeneID") %>%
+  arrange(padj)
+
+write_csv(res_sinet_df, "results/SINET_DE_Metastasis_vs_Primary.csv")
+
+summary(res_sinet)
+sum(res_sinet_df$padj < 0.05, na.rm = TRUE)
+```
+
+# 12. Shared Metastasis Signature
+
+```{r shared-signature}
+# ============================================================
+# 16. SHARED SIGNIFICANT GENES
+# ============================================================
+
+padj_cutoff <- 0.05
+
+res_pan_clean <- as.data.frame(res_pan)
+res_sinet_clean <- as.data.frame(res_sinet)
+
+res_pan_clean <- res_pan_clean[!is.na(res_pan_clean$padj), ]
+res_sinet_clean <- res_sinet_clean[!is.na(res_sinet_clean$padj), ]
+
+pan_sig <- res_pan_clean[res_pan_clean$padj < padj_cutoff, ]
+sinet_sig <- res_sinet_clean[res_sinet_clean$padj < padj_cutoff, ]
+
+pan_genes <- rownames(pan_sig)
+sinet_genes <- rownames(sinet_sig)
+
+shared_genes <- intersect(pan_genes, sinet_genes)
+
+pan_fc <- pan_sig[shared_genes, "log2FoldChange"]
+sinet_fc <- sinet_sig[shared_genes, "log2FoldChange"]
+
+same_direction <- sum(sign(pan_fc) == sign(sinet_fc))
+opposite_direction <- sum(sign(pan_fc) != sign(sinet_fc))
+
+table_shared_summary <- data.frame(
+  Metric = c(
+    "PanNET significant genes",
+    "SI-NET significant genes",
+    "Shared significant genes",
+    "Percent of PanNET shared",
+    "Percent of SI-NET shared",
+    "Shared genes same direction",
+    "Shared genes opposite direction"
+  ),
+  Value = c(
+    length(pan_genes),
+    length(sinet_genes),
+    length(shared_genes),
+    round(100 * length(shared_genes) / length(pan_genes), 2),
+    round(100 * length(shared_genes) / length(sinet_genes), 2),
+    same_direction,
+    opposite_direction
+  )
+)
+
+table_shared_summary
+
+write_csv(table_shared_summary, "results/shared_signature_summary.csv")
+```
+
+```{r shared-fc-plot, fig.width=7, fig.height=5}
+plot_df <- data.frame(
+  PanNET = pan_fc,
+  SINET = sinet_fc
+)
+
+p_shared_fc <- ggplot(plot_df, aes(x = PanNET, y = SINET)) +
+  geom_point(alpha = 0.6, size = 1.5) +
+  theme_classic() +
+  xlab("log2FC PanNET (Metastasis vs Primary)") +
+  ylab("log2FC SI-NET (Metastasis vs Primary)") +
+  ggtitle("Shared Metastasis Genes: PanNET vs SI-NET")
+
+p_shared_fc
+
+ggsave("figures/shared_gene_log2fc_scatter.png", p_shared_fc, width = 7, height = 5, dpi = 300)
+```
+
+# 13. GO Enrichment of Shared Upregulated Metastasis Genes
+
+```{r go-enrichment}
+# ============================================================
+# 17. GO ENRICHMENT
+# ============================================================
+
+shared_up_met <- shared_genes[
+  pan_sig[shared_genes, "log2FoldChange"] > 0 &
+    sinet_sig[shared_genes, "log2FoldChange"] > 0
+]
+
+length(shared_up_met)
+
+entrez_genes <- as.character(shared_up_met)
+
+ego_shared <- enrichGO(
+  gene          = entrez_genes,
+  OrgDb         = org.Hs.eg.db,
+  keyType       = "ENTREZID",
+  ont           = "BP",
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.05,
+  qvalueCutoff  = 0.05
+)
+
+ego_df <- as.data.frame(ego_shared)
+
+write_csv(ego_df, "results/shared_upregulated_GO_enrichment.csv")
+
+ego_df[, c("Description", "GeneRatio", "p.adjust", "Count")][1:10, ]
+```
+
+```{r go-dotplot, fig.width=8, fig.height=5}
+p_go <- dotplot(
+  ego_shared,
+  showCategory = 8,
+  font.size = 12
+) +
+  ggtitle("Shared Metastasis Program Enriched for Biological Processes") +
+  theme(
+    axis.text.y = element_text(size = 11),
+    plot.title = element_text(hjust = 0.5, size = 15, face = "bold")
+  )
+
+p_go
+
+ggsave("figures/shared_GO_dotplot.png", p_go, width = 8, height = 5, dpi = 300)
+```
+
+# 14. Shared Metastasis Signature Score
+
+```{r signature-score, fig.width=7, fig.height=5}
+# ============================================================
+# 18. SIGNATURE SCORE
+# ============================================================
+
+sig_mat <- vsd_mat[rownames(vsd_mat) %in% shared_up_met, ]
+sig_mat_z <- t(scale(t(sig_mat)))
+
+signature_score <- colMeans(sig_mat_z, na.rm = TRUE)
+
+sig_df <- data.frame(
+  sample = colnames(vsd_mat),
+  signature_score = signature_score,
+  status = colData(dds)$status,
+  site = colData(dds)$site
+)
+
+p_sig_all <- ggplot(sig_df, aes(x = status, y = signature_score, fill = status)) +
+  geom_boxplot(alpha = 0.7, outlier.shape = NA) +
+  geom_jitter(width = 0.15, size = 1.8, alpha = 0.6) +
+  theme_minimal() +
+  labs(
+    title = "Shared Metastasis Signature Score",
+    y = "Signature Score",
+    x = ""
+  ) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    legend.position = "none"
+  )
+
+p_sig_all
+
+ggsave("figures/shared_signature_score_all.png", p_sig_all, width = 7, height = 5, dpi = 300)
+
+t.test(signature_score ~ sig_df$status)
+```
+
+```{r signature-score-by-tissue, fig.width=8, fig.height=5}
+p_sig_site <- ggplot(sig_df, aes(x = status, y = signature_score, fill = status)) +
+  geom_boxplot(alpha = 0.7, outlier.shape = NA) +
+  geom_jitter(width = 0.15, size = 1.8, alpha = 0.6) +
+  facet_wrap(~ site) +
+  theme_minimal() +
+  labs(
+    title = "Shared Metastasis Signature Score by Tissue",
+    y = "Signature Score",
+    x = ""
+  ) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    legend.position = "none"
+  )
+
+p_sig_site
+
+ggsave("figures/shared_signature_score_by_tissue.png", p_sig_site, width = 8, height = 5, dpi = 300)
+```
+
+# 15. Ranked Shared Metastasis Gene List
+
+```{r ranked-gene-list}
+# ============================================================
+# 19. BUILD RANKED SHARED METASTASIS GENE LIST
+# ============================================================
+
+padj_cutoff <- 0.05
+lfc_cutoff <- 1
+
+res_pan_df2 <- as.data.frame(res_pan) %>%
+  rownames_to_column("GeneID")
+
+res_sinet_df2 <- as.data.frame(res_sinet) %>%
+  rownames_to_column("GeneID")
+
+pan_sig2 <- res_pan_df2 %>%
+  filter(!is.na(padj), padj < padj_cutoff, abs(log2FoldChange) >= lfc_cutoff)
+
+sinet_sig2 <- res_sinet_df2 %>%
+  filter(!is.na(padj), padj < padj_cutoff, abs(log2FoldChange) >= lfc_cutoff)
+
+shared_tbl <- inner_join(
+  pan_sig2 %>% select(GeneID, log2FoldChange, padj),
+  sinet_sig2 %>% select(GeneID, log2FoldChange, padj),
+  by = "GeneID",
+  suffix = c("_PanNET", "_SINET")
+)
+
+shared_up_tbl <- shared_tbl %>%
+  filter(log2FoldChange_PanNET > 0, log2FoldChange_SINET > 0) %>%
+  mutate(
+    mean_log2FC = (log2FoldChange_PanNET + log2FoldChange_SINET) / 2,
+    mean_padj_score = ((-log10(padj_PanNET)) + (-log10(padj_SINET))) / 2
+  ) %>%
+  arrange(desc(mean_log2FC), desc(mean_padj_score))
+
+gene_map <- bitr(
+  shared_up_tbl$GeneID,
+  fromType = "ENTREZID",
+  toType = c("SYMBOL", "GENENAME"),
+  OrgDb = org.Hs.eg.db
+)
+
+shared_up_annotated <- shared_up_tbl %>%
+  left_join(gene_map, by = c("GeneID" = "ENTREZID")) %>%
+  relocate(SYMBOL, GENENAME, .after = GeneID)
+
+write_csv(shared_up_tbl, "results/shared_metastasis_gene_list_ranked.csv")
+write_csv(shared_up_annotated, "results/shared_metastasis_gene_list_annotated.csv")
+
+head(shared_up_annotated, 20)
+```
+
+# 16. Final Interpretation
+
+This project supports a tissue-stratified view of metastasis in GEP-NETs.
+Tissue of origin is the dominant source of transcriptomic variation, but both
+PanNETs and SI-NETs show metastasis-associated gene expression changes. The
+overlap of significant genes with consistent directionality suggests that a
+shared metastatic transcriptional program exists across these tumor types.
+
+At the same time, the PCA results indicate that metastasis is not simply one
+uniform global shift across all samples. Instead, metastasis appears to be a
+context-dependent process layered onto tissue-specific tumor biology.

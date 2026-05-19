@@ -1,0 +1,18 @@
+R packages used:
+
+CRAN:
+- tidyverse
+- ggplot2
+- pheatmap
+
+Bioconductor:
+- DESeq2
+- apeglm
+- clusterProfiler
+- org.Hs.eg.db
+
+Optional for promoter/motif extension:
+- GenomicFeatures
+- TxDb.Hsapiens.UCSC.hg38.knownGene
+- BSgenome.Hsapiens.UCSC.hg38
+- Biostrings
